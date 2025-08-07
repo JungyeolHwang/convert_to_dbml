@@ -172,7 +172,16 @@ class DDLToDBMLConverter:
             return
         
         # DBML로 변환
-        dbml_content = self.dbml_converter.convert_tables_to_dbml(all_tables, schema_name)
+        try:
+            dbml_content = self.dbml_converter.convert_tables_to_dbml(all_tables, schema_name)
+        except Exception as e:
+            error_msg = f"{db_name}/{schema_name}: {e}"
+            self.stats['errors'].append(error_msg)
+            print(f"  ❌ {schema_name}: {e}")
+            import traceback
+            if self.verbose:
+                print(f"  🔍 상세 오류: {traceback.format_exc()}")
+            return
         
         # 누락된 컬럼 감지 및 수정
         schema_dir = Path(ddl_files[0]).parent if ddl_files else None

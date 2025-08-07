@@ -86,12 +86,17 @@ class DBMLConverter:
         
         # 컬럼 정의
         for column in table_info.get('columns', []):
+            # 유효하지 않은 컬럼명 필터링
+            if not self._is_valid_column_name(column['name']):
+                continue
+                
             # Primary key 정보 추가
             if column['name'].lower() in primary_key_columns:
                 column['primary_key'] = True
             
             column_line = self._convert_column_to_dbml(column)
-            lines.append(f"  {column_line}")
+            if column_line.strip():  # 빈 라인 제외
+                lines.append(f"  {column_line}")
         
         # 인덱스 정의 (그룹화)
         constraints = table_info.get('constraints', [])
@@ -111,6 +116,11 @@ class DBMLConverter:
                 actual_cols = self._get_actual_column_names(table_info, constraint['columns'])
                 columns_str = ', '.join(actual_cols)
                 index_definitions.append(f"    ({columns_str})")
+            elif constraint['type'] == 'fulltext':
+                # FULLTEXT 인덱스는 주석으로 처리 (DBML에서 직접 지원하지 않음)
+                actual_cols = self._get_actual_column_names(table_info, constraint['columns'])
+                columns_str = ', '.join(actual_cols)
+                index_definitions.append(f"    // FULLTEXT INDEX on ({columns_str})")
         
         # 인덱스가 있으면 하나의 Indexes 블록으로 그룹화
         if index_definitions:
@@ -121,11 +131,15 @@ class DBMLConverter:
         
         lines.append("}")
         
-        return "\n".join(lines)
+        return self._clean_dbml_output("\n".join(lines))
     
     def _convert_column_to_dbml(self, column: Dict) -> str:
         """컬럼 정의를 DBML 형식으로 변환"""
         name = self._escape_table_name(column['name'])
+        
+        # 컬럼 타입이 없거나 유효하지 않은 경우 제외
+        if not column.get('type') or not isinstance(column['type'], str) or column['type'].strip() == "":
+            return ""
         
         # 타입 변환
         mysql_type = column['type'].upper()
@@ -362,22 +376,134 @@ class DBMLConverter:
         table_columns = {col['name'].lower(): col['name'] for col in table_info['columns']}
         
         for col_name in column_names:
-            # 소문자로 비교해서 실제 컬럼명 찾기
-            actual_name = table_columns.get(col_name.lower(), col_name)
-            actual_columns.append(actual_name)
+            # 소문자로 비교해서 실제 컬럼명 찾기 (None 값 안전 처리)
+            if col_name is None:
+                print(f"⚠️  경고: None 컬럼명 발견 in table {table_info.get('name', 'unknown')}")
+                continue
+            try:
+                actual_name = table_columns.get(col_name.lower(), col_name)
+                actual_columns.append(actual_name)
+            except AttributeError as e:
+                print(f"⚠️  경고: 컬럼명 처리 오류 in table {table_info.get('name', 'unknown')}: {col_name} -> {e}")
+                continue
         
         return actual_columns
     
+    def _is_valid_column_name(self, name: str) -> bool:
+        """유효한 컬럼명인지 검사"""
+        if not name or not isinstance(name, str):
+            return False
+        
+        # SQL 키워드나 구문이 포함된 경우 제외
+        invalid_patterns = [
+            'PRIMARY KEY', 'FOREIGN KEY', 'UNIQUE KEY', 'KEY ', 'INDEX ',
+            'CONSTRAINT', 'REFERENCES', 'ENGINE=', 'CHARSET=', 'COLLATE=',
+            'AUTO_INCREMENT', 'ON UPDATE', 'ON DELETE', 'KEY `', '`idx_',
+            'bannerkey', 'last_game_date', 'last_login_date'
+        ]
+        
+        name_upper = name.upper()
+        for pattern in invalid_patterns:
+            if pattern in name_upper:
+                return False
+        
+        # 빈 문자열이나 특수 문자만 있는 경우 제외
+        if name.strip() == '' or name.strip() in ['"', "'", '`']:
+            return False
+        
+        # 숫자로만 구성된 경우 제외 (부분적으로)
+        if name.strip().isdigit():
+            return False
+        
+        # 백틱으로 시작하는 경우 제외 (인덱스명일 가능성)
+        if name.startswith('`') or name.startswith('idx_'):
+            return False
+        
+        # KEY로 시작하는 경우 제외
+        if name.upper().startswith('KEY'):
+            return False
+        
+        # 괄호나 이상한 기호가 포함된 경우 제외
+        if any(char in name for char in [')', '(', ';', '{', '}', '[', ']']):
+            return False
+        
+        # 데이터 타입만 있고 컬럼명이 없는 경우 제외
+        if name.upper() in ['INT', 'VARCHAR', 'TEXT', 'DATETIME', 'DATE', 'CHAR', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'BIGINT']:
+            return False
+            
+        return True
+    
+    def _clean_dbml_output(self, dbml_content: str) -> str:
+        """DBML 출력에서 잘못된 라인들을 제거하고 정리"""
+        lines = dbml_content.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            # 빈 라인은 그대로 유지
+            if line.strip() == "":
+                cleaned_lines.append(line)
+                continue
+            
+            # 잘못된 패턴들을 필터링
+            stripped = line.strip()
+            
+            # 괄호만 있는 라인 제거
+            if stripped == ')' or stripped == '(':
+                continue
+            
+            # 컬럼명 뒤에 괄호만 있는 라인 제거
+            if stripped.endswith(' )') and not stripped.startswith('  '):
+                continue
+            
+            # 데이터 타입이나 속성 없이 컬럼명과 괄호만 있는 라인 제거
+            if ' )' in stripped and not any(keyword in stripped for keyword in ['[', 'default:', 'pk', 'not null', 'unique']):
+                continue
+            
+            cleaned_lines.append(line)
+        
+        # 연속된 빈 라인 제거
+        final_lines = []
+        prev_empty = False
+        
+        for line in cleaned_lines:
+            if line.strip() == "":
+                if not prev_empty:
+                    final_lines.append(line)
+                prev_empty = True
+            else:
+                final_lines.append(line)
+                prev_empty = False
+        
+        return '\n'.join(final_lines)
+    
     def _find_table_in_data(self, tables_data: Dict[str, Dict], table_name: str) -> Optional[Dict]:
         """테이블 데이터에서 특정 테이블 찾기 (대소문자 무시)"""
+        if not table_name:
+            return None
+            
         for tname, tinfo in tables_data.items():
+            # tname이나 table_name이 None인 경우 처리
+            if not tname or not isinstance(tname, str):
+                continue
+            if not isinstance(table_name, str):
+                continue
+                
             if tname.lower() == table_name.lower():
                 return tinfo
         return None
     
     def _find_table_in_data_with_name(self, tables_data: Dict[str, Dict], table_name: str) -> Tuple[Optional[Dict], Optional[str]]:
         """테이블 데이터에서 특정 테이블 찾기 (대소문자 무시) - 실제 테이블명도 반환"""
+        if not table_name:
+            return None, None
+            
         for tname, tinfo in tables_data.items():
+            # tname이나 table_name이 None인 경우 처리
+            if not tname or not isinstance(tname, str):
+                continue
+            if not isinstance(table_name, str):
+                continue
+                
             if tname.lower() == table_name.lower():
                 return tinfo, tname
         return None, None

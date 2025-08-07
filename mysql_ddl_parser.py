@@ -60,11 +60,35 @@ class MySQLDDLParser(BaseDDLParser):
         
         for statement in parsed:
             if statement.get_type() == 'CREATE':
-                table_data = self._parse_create_table(statement)
-                if table_data:
-                    table_info[table_data['name']] = table_data
+                # CREATE TABLE만 처리하도록 필터링
+                if self._is_create_table_statement(statement):
+                    table_data = self._parse_create_table(statement)
+                    if table_data:
+                        table_info[table_data['name']] = table_data
         
         return table_info
+    
+    def _is_create_table_statement(self, statement) -> bool:
+        """CREATE 문이 CREATE TABLE인지 확인 (PROCEDURE, FUNCTION 등 제외)"""
+        tokens = list(statement.flatten())
+        
+        # CREATE 다음에 오는 키워드 확인
+        create_found = False
+        for token in tokens:
+            if token.ttype in (Keyword, Keyword.DDL) and token.value.upper() == 'CREATE':
+                create_found = True
+                continue
+            
+            if create_found and token.ttype in (Keyword, Keyword.DDL):
+                keyword = token.value.upper()
+                # TABLE인 경우만 True 반환
+                if keyword == 'TABLE':
+                    return True
+                # PROCEDURE, FUNCTION, VIEW 등은 False 반환
+                elif keyword in ('PROCEDURE', 'FUNCTION', 'VIEW', 'INDEX', 'TRIGGER', 'EVENT'):
+                    return False
+        
+        return False
     
     def _parse_create_table(self, statement: Statement) -> Optional[Dict]:
         """CREATE TABLE 문을 파싱"""
@@ -108,28 +132,9 @@ class MySQLDDLParser(BaseDDLParser):
             # 문자열 기반으로 직접 파싱
             columns, constraints = self._parse_table_definition_from_string(table_content_token)
         else:
-            # 기존 토큰 기반 방식
-            for i, token in enumerate(tokens):
-                if token.value == '(' and table_def_start == -1:
-                    table_def_start = i
-                    paren_count = 1
-                    continue
-                elif table_def_start != -1:
-                    if token.value == '(':
-                        paren_count += 1
-                    elif token.value == ')':
-                        paren_count -= 1
-                    
-                    if paren_count == 0:
-                        break
-                    
-                    table_def_tokens.append(token)
-            
-            if not table_def_tokens:
-                return None
-            
-            # 컬럼과 제약조건 파싱
-            columns, constraints = self._parse_table_definition(table_def_tokens)
+            # 전체 statement를 문자열로 변환해서 파싱 (ENUM 처리를 위해)
+            full_statement = str(statement)
+            columns, constraints = self._parse_table_definition_from_string(full_statement)
         
         return {
             'name': table_name,
@@ -146,17 +151,8 @@ class MySQLDDLParser(BaseDDLParser):
             cleaned = cleaned.split('@')[0]
         return cleaned
     
-    def _parse_table_definition_from_string(self, content: str) -> Tuple[List[Dict], List[Dict]]:
-        """문자열에서 직접 테이블 정의를 파싱"""
-        # 괄호 안의 내용만 추출
-        start = content.find('(')
-        end = content.rfind(')')
-        if start == -1 or end == -1:
-            return [], []
-        
-        table_content = content[start+1:end]
-        
-        # 정교한 콤마 분리 (COMMENT 내부의 콤마는 무시)
+    def _simple_comma_split(self, table_content: str) -> List[str]:
+        """간단한 콤마 분리 로직 (백업용)"""
         items = []
         current_item = ""
         in_comment = False
@@ -168,19 +164,21 @@ class MySQLDDLParser(BaseDDLParser):
             char = table_content[i]
             
             # COMMENT 키워드 감지
-            if not in_comment and table_content[i:i+7].upper() == 'COMMENT':
-                in_comment = True
+            if not in_comment and not quote_char and table_content[i:i+7].upper() == 'COMMENT':
+                if i + 7 < len(table_content) and table_content[i+7] in [' ', '\t', "'", '"']:
+                    in_comment = True
                 current_item += char
                 i += 1
                 continue
             
-            # 따옴표 처리 (COMMENT 안에서)
-            elif in_comment and char in ["'", '"'] and (i == 0 or table_content[i-1] != '\\'):
+            # 따옴표 처리
+            elif char in ["'", '"'] and (i == 0 or table_content[i-1] != '\\'):
                 if quote_char is None:
                     quote_char = char
                 elif quote_char == char:
                     quote_char = None
-                    in_comment = False
+                    if in_comment:
+                        in_comment = False
                 current_item += char
                 
             # 괄호 처리
@@ -206,6 +204,32 @@ class MySQLDDLParser(BaseDDLParser):
         # 마지막 아이템 추가
         if current_item.strip():
             items.append(current_item.strip())
+        
+        return items
+    
+    def _preprocess_table_content(self, table_content: str) -> str:
+        """테이블 내용 전처리 - COMMENT 내부의 복잡한 문자를 단순화"""
+        # COMMENT '복잡한내용' 을 COMMENT 'comment' 로 단순화
+        processed = re.sub(r"COMMENT\s*'[^']*'", "COMMENT 'comment'", table_content, flags=re.IGNORECASE)
+        # COMMENT "복잡한내용" 도 처리
+        processed = re.sub(r'COMMENT\s*"[^"]*"', 'COMMENT "comment"', processed, flags=re.IGNORECASE)
+        return processed
+    
+    def _parse_table_definition_from_string(self, content: str) -> Tuple[List[Dict], List[Dict]]:
+        """문자열에서 직접 테이블 정의를 파싱"""
+        # 괄호 안의 내용만 추출
+        start = content.find('(')
+        end = content.rfind(')')
+        if start == -1 or end == -1:
+            return [], []
+        
+        table_content = content[start+1:end]
+        
+        # 전처리: COMMENT 부분에서 복잡한 내용 제거하고 단순화
+        table_content = self._preprocess_table_content(table_content)
+        
+        # 간단한 콤마 분리 사용
+        items = self._simple_comma_split(table_content)
         
         columns = []
         constraints = []
@@ -355,23 +379,36 @@ class MySQLDDLParser(BaseDDLParser):
     
     def _parse_column_from_string(self, item: str) -> Optional[Dict]:
         """문자열에서 컬럼 정의를 파싱"""
-        # 기본적인 컬럼 정의 패턴 매칭
-        column_match = re.match(r'^\s*([`\w]+)\s+([^,\s]+)', item.strip())
+        # 기본적인 컬럼 정의 패턴 매칭 (ENUM, SET 포함)  
+        # ENUM('val1','val2') 같은 복잡한 타입도 매칭하도록 개선
+        column_match = re.match(r'^\s*([`\w]+)\s+(\w+(?:\([^)]*\))?)', item.strip())
         if not column_match:
             return None
         
         column_name = self._clean_identifier(column_match.group(1))
         data_type = column_match.group(2)
         
-        # 데이터 타입에서 크기 정보 추출
-        type_match = re.match(r'([A-Za-z]+)(\(([^)]+)\))?', data_type)
+        # 데이터 타입에서 크기 정보 추출 (ENUM, SET 포함)
+        # ENUM('val1','val2') 또는 SET('val1','val2') 같은 복잡한 타입도 처리
+        type_match = re.match(r'([A-Za-z]+)(\(([^)]*)\))?', data_type)
         if type_match:
-            base_type = type_match.group(1)
+            base_type = type_match.group(1).upper()
             size_info = type_match.group(3) if type_match.group(3) else None
+            
+            # ENUM이나 SET 타입의 경우 전체 문자열에서 괄호 부분을 다시 찾기
+            if base_type in ['ENUM', 'SET'] and size_info is None:
+                # 원본 item에서 ENUM(...) 전체 부분 찾기
+                enum_match = re.search(rf'{base_type}\s*\(([^)]*)\)', item, re.IGNORECASE)
+                if enum_match:
+                    size_info = enum_match.group(1)
+            
             if size_info:
                 data_type = f"{base_type}({size_info})"
             else:
                 data_type = base_type
+        else:
+            # 패턴 매칭 실패 시 원본 사용
+            data_type = data_type.upper()
         
         # 속성들 파싱
         attributes = []
@@ -433,6 +470,25 @@ class MySQLDDLParser(BaseDDLParser):
                     'columns': columns
                 }
         
+        # FULLTEXT 처리 (FULLTEXT KEY 또는 FULLTEXT INDEX)
+        if 'FULLTEXT KEY' in item_upper or 'FULLTEXT INDEX' in item_upper:
+            columns = self._extract_columns_from_string(item)
+            if columns:
+                return {
+                    'type': 'fulltext',
+                    'columns': columns
+                }
+        
+        # INDEX/KEY 처리 (일반 인덱스) - 컬럼 정의와 구분하기 위해 더 정확한 패턴 매칭
+        if (item_upper.strip().startswith('KEY ') or item_upper.strip().startswith('INDEX ') or 
+            ' KEY ' in item_upper or ' INDEX ' in item_upper) and 'FOREIGN' not in item_upper and 'PRIMARY' not in item_upper and 'UNIQUE' not in item_upper and 'FULLTEXT' not in item_upper:
+            columns = self._extract_columns_from_string(item)
+            if columns:
+                return {
+                    'type': 'index',
+                    'columns': columns
+                }
+        
         return None
     
     def _extract_columns_from_constraint(self, token_values: List[str]) -> List[str]:
@@ -468,15 +524,55 @@ class MySQLDDLParser(BaseDDLParser):
         return columns
     
     def _extract_columns_from_string(self, item: str) -> List[str]:
-        """문자열에서 컬럼명 추출"""
-        # 괄호 안의 내용 찾기
-        match = re.search(r'\(([^)]+)\)', item)
-        if not match:
+        """문자열에서 컬럼명 추출 (인덱스 길이 및 정렬 순서 처리)"""
+        # 중첩된 괄호를 고려한 괄호 매칭
+        start_idx = item.find('(')
+        if start_idx == -1:
             return []
         
-        columns_str = match.group(1)
-        columns = [self._clean_identifier(col.strip()) for col in columns_str.split(',')]
-        return [col for col in columns if col]
+        # 균형 잡힌 괄호 찾기
+        paren_count = 0
+        end_idx = -1
+        
+        for i in range(start_idx, len(item)):
+            if item[i] == '(':
+                paren_count += 1
+            elif item[i] == ')':
+                paren_count -= 1
+                if paren_count == 0:
+                    end_idx = i
+                    break
+        
+        if end_idx == -1:
+            return []
+        
+        columns_str = item[start_idx + 1:end_idx]
+        columns = []
+        
+        # 단계별 처리 방식
+        # 1. 콤마로 분리
+        parts = columns_str.split(',')
+        
+        for part in parts:
+            part = part.strip()
+            
+            # 2. 각 부분에서 컬럼명만 추출
+            # `column_name`(length) -> column_name
+            # column_name ASC/DESC -> column_name
+            
+            # (length) 부분 먼저 제거
+            part = re.sub(r'\([^)]*\)', '', part)
+            
+            # ASC/DESC 제거
+            part = re.sub(r'\s+(ASC|DESC)\s*$', '', part, flags=re.IGNORECASE)
+            
+            # 백틱 등 제거
+            col_name = self._clean_identifier(part.strip())
+            
+            if col_name:
+                columns.append(col_name)
+                
+        return columns
     
     def _parse_foreign_key_constraint(self, token_values: List[str]) -> Optional[Dict]:
         """FOREIGN KEY 제약조건 파싱"""
