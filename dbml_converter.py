@@ -328,6 +328,25 @@ class DBMLConverter:
             return f'"{name}"'
         return name
     
+    def _format_table_reference(self, table_name: str) -> str:
+        """
+        DBML 참조에서 사용할 테이블명 형식 처리
+        
+        Args:
+            table_name: 테이블명 (스키마명 포함 가능)
+            
+        Returns:
+            DBML 형식에 맞는 테이블 참조명, 크로스 스키마 참조는 None 반환
+        """
+        # 백틱 제거
+        clean_name = table_name.replace('`', '')
+        
+        # 스키마.테이블 형식인지 확인
+        if '.' in clean_name and not clean_name.startswith('"'):
+            # 크로스 스키마 참조는 DBML에서 지원하지 않으므로 None 반환
+            return None
+        return clean_name
+    
     def _extract_references(self, tables_data: Dict[str, Dict]) -> List[str]:
         """Foreign Key 관계를 DBML Reference 형식으로 추출"""
         references = []
@@ -349,21 +368,47 @@ class DBMLConverter:
                     
                     # 단일 컬럼 FK인 경우
                     if len(source_cols) == 1 and len(target_cols) == 1:
-                        ref_line = (f"Ref: {table_name}.{source_cols[0]} "
-                                  f"> {target_table_name}.{target_cols[0]}")
-                        # 중복 체크 후 추가
-                        if ref_line not in seen_references:
-                            references.append(ref_line)
-                            seen_references.add(ref_line)
-                    elif len(source_cols) == len(target_cols) and len(source_cols) > 0:
-                        # 복합 컬럼 FK인 경우 - 단일 컬럼 관계들로 분리
-                        # dbdiagram.io에서 복합 키 관계가 제대로 인식되지 않는 경우가 있음
-                        for i in range(len(source_cols)):
-                            ref_line = f"Ref: {table_name}.{source_cols[i]} > {target_table_name}.{target_cols[i]}"
+                        # 스키마.테이블 형식의 테이블명 처리
+                        formatted_source_table = self._format_table_reference(table_name)
+                        formatted_target_table = self._format_table_reference(target_table_name)
+                        
+                        # 크로스 스키마 참조인 경우 주석으로 처리
+                        if formatted_target_table is None:
+                            # 백틱 제거 후 주석 생성
+                            clean_target_table = target_table_name.replace('`', '')
+                            ref_comment = f"// Cross-schema reference: {table_name}.{source_cols[0]} > {clean_target_table}.{target_cols[0]}"
+                            if ref_comment not in seen_references:
+                                references.append(ref_comment)
+                                seen_references.add(ref_comment)
+                        elif formatted_source_table is not None:
+                            ref_line = (f"Ref: {formatted_source_table}.{source_cols[0]} "
+                                      f"> {formatted_target_table}.{target_cols[0]}")
                             # 중복 체크 후 추가
                             if ref_line not in seen_references:
                                 references.append(ref_line)
                                 seen_references.add(ref_line)
+                    elif len(source_cols) == len(target_cols) and len(source_cols) > 0:
+                        # 복합 컬럼 FK인 경우 - 단일 컬럼 관계들로 분리
+                        # dbdiagram.io에서 복합 키 관계가 제대로 인식되지 않는 경우가 있음
+                        for i in range(len(source_cols)):
+                            # 스키마.테이블 형식의 테이블명 처리
+                            formatted_source_table = self._format_table_reference(table_name)
+                            formatted_target_table = self._format_table_reference(target_table_name)
+                            
+                            # 크로스 스키마 참조인 경우 주석으로 처리
+                            if formatted_target_table is None:
+                                # 백틱 제거 후 주석 생성
+                                clean_target_table = target_table_name.replace('`', '')
+                                ref_comment = f"// Cross-schema reference: {table_name}.{source_cols[i]} > {clean_target_table}.{target_cols[i]}"
+                                if ref_comment not in seen_references:
+                                    references.append(ref_comment)
+                                    seen_references.add(ref_comment)
+                            elif formatted_source_table is not None:
+                                ref_line = f"Ref: {formatted_source_table}.{source_cols[i]} > {formatted_target_table}.{target_cols[i]}"
+                                # 중복 체크 후 추가
+                                if ref_line not in seen_references:
+                                    references.append(ref_line)
+                                    seen_references.add(ref_line)
         
         return references
     
@@ -678,8 +723,19 @@ class DBMLConverter:
     
     def _extract_columns_from_ddl_file(self, ddl_file_path: str) -> List[Dict]:
         """DDL 파일에서 컬럼들을 직접 추출 (파서가 놓치는 컬럼들도 포함)"""
-        with open(ddl_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # 시도할 인코딩 리스트
+        encodings = ['utf-8', 'cp949', 'euc-kr', 'latin-1']
+        
+        for encoding in encodings:
+            try:
+                with open(ddl_file_path, 'r', encoding=encoding) as f:
+                    content = f.read()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            # 모든 인코딩 실패 시 오류 발생
+            raise UnicodeDecodeError(f"Cannot decode file {ddl_file_path} with any of the supported encodings: {encodings}")
         
         # 간단한 정규식으로 컬럼 정의 찾기
         column_pattern = r'`([^`]+)`\s+([a-zA-Z]+(?:\([^)]*\))?)\s+([^,]+?)(?=,|\n\s*(?:PRIMARY|UNIQUE|KEY|CONSTRAINT|\)))'

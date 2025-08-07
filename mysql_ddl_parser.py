@@ -379,36 +379,34 @@ class MySQLDDLParser(BaseDDLParser):
     
     def _parse_column_from_string(self, item: str) -> Optional[Dict]:
         """문자열에서 컬럼 정의를 파싱"""
-        # 기본적인 컬럼 정의 패턴 매칭 (ENUM, SET 포함)  
-        # ENUM('val1','val2') 같은 복잡한 타입도 매칭하도록 개선
-        column_match = re.match(r'^\s*([`\w]+)\s+(\w+(?:\([^)]*\))?)', item.strip())
+        # PARTITION 구문 필터링 (MySQL 파티셔닝은 DBML에서 지원하지 않음)
+        item_stripped = item.strip()
+        if item_stripped.upper().startswith('PARTITION '):
+            return None
+        
+        # 컬럼명과 기본 타입 추출
+        column_match = re.match(r'^\s*([`\w]+)\s+(\w+)', item_stripped)
         if not column_match:
             return None
         
         column_name = self._clean_identifier(column_match.group(1))
-        data_type = column_match.group(2)
+        base_type = column_match.group(2).upper()
         
-        # 데이터 타입에서 크기 정보 추출 (ENUM, SET 포함)
-        # ENUM('val1','val2') 또는 SET('val1','val2') 같은 복잡한 타입도 처리
-        type_match = re.match(r'([A-Za-z]+)(\(([^)]*)\))?', data_type)
-        if type_match:
-            base_type = type_match.group(1).upper()
-            size_info = type_match.group(3) if type_match.group(3) else None
-            
-            # ENUM이나 SET 타입의 경우 전체 문자열에서 괄호 부분을 다시 찾기
-            if base_type in ['ENUM', 'SET'] and size_info is None:
-                # 원본 item에서 ENUM(...) 전체 부분 찾기
-                enum_match = re.search(rf'{base_type}\s*\(([^)]*)\)', item, re.IGNORECASE)
-                if enum_match:
-                    size_info = enum_match.group(1)
-            
+        # ENUM이나 SET 타입의 경우 전체 문자열에서 괄호 부분을 찾기
+        if base_type in ['ENUM', 'SET']:
+            size_info = self._extract_enum_values(item, base_type)
             if size_info:
                 data_type = f"{base_type}({size_info})"
             else:
                 data_type = base_type
         else:
-            # 패턴 매칭 실패 시 원본 사용
-            data_type = data_type.upper()
+            # 일반 타입의 경우 원본에서 타입 부분 전체 추출
+            type_pattern = rf'\b{re.escape(base_type)}\b(\([^)]*\))?'
+            type_match = re.search(type_pattern, item, re.IGNORECASE)
+            if type_match and type_match.group(1):
+                data_type = f"{base_type}{type_match.group(1)}"
+            else:
+                data_type = base_type
         
         # 속성들 파싱
         attributes = []
@@ -426,10 +424,15 @@ class MySQLDDLParser(BaseDDLParser):
         if 'UNIQUE' in item_upper and 'UNIQUE KEY' not in item_upper:
             attributes.append('unique')
         
-        # DEFAULT 값 추출
-        default_match = re.search(r'DEFAULT\s+([^,\s]+)', item, re.IGNORECASE)
+        # DEFAULT 값 추출 (한글 포함)
+        default_match = re.search(r"DEFAULT\s+['\"]([^'\"]*)['\"]", item, re.IGNORECASE)
         if default_match:
-            default_value = default_match.group(1)
+            default_value = f"'{default_match.group(1)}'"
+        else:
+            # 따옴표 없는 DEFAULT 값도 처리
+            default_match = re.search(r'DEFAULT\s+([^,\s]+)', item, re.IGNORECASE)
+            if default_match:
+                default_value = default_match.group(1)
         
         # COMMENT 추출
         comment_match = re.search(r"COMMENT\s+['\"]([^'\"]*)['\"]", item, re.IGNORECASE)
@@ -443,6 +446,46 @@ class MySQLDDLParser(BaseDDLParser):
             'default': default_value,
             'comment': comment
         }
+    
+    def _extract_enum_values(self, item: str, base_type: str) -> Optional[str]:
+        """ENUM/SET 타입에서 값들을 추출 (중첩된 괄호 처리)"""
+        # ENUM 또는 SET 시작 위치 찾기
+        type_start = item.upper().find(base_type.upper())
+        if type_start == -1:
+            return None
+        
+        # 타입명 다음의 첫 번째 '(' 찾기
+        paren_start = item.find('(', type_start)
+        if paren_start == -1:
+            return None
+        
+        # 균형 잡힌 괄호 찾기
+        bracket_count = 0
+        quote_char = None
+        i = paren_start
+        
+        while i < len(item):
+            char = item[i]
+            
+            # 따옴표 처리
+            if char in ("'", '"') and (i == 0 or item[i-1] != '\\'):
+                if quote_char is None:
+                    quote_char = char
+                elif quote_char == char:
+                    quote_char = None
+            # 따옴표 안이 아닐 때만 괄호 카운트
+            elif quote_char is None:
+                if char == '(':
+                    bracket_count += 1
+                elif char == ')':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        # 균형 잡힌 괄호 완성
+                        return item[paren_start + 1:i]
+            
+            i += 1
+        
+        return None
     
     def _parse_constraint_from_string(self, item: str) -> Optional[Dict]:
         """문자열에서 제약조건을 파싱"""
@@ -547,21 +590,30 @@ class MySQLDDLParser(BaseDDLParser):
             return []
         
         columns_str = item[start_idx + 1:end_idx]
+        
         columns = []
         
         # 단계별 처리 방식
-        # 1. 콤마로 분리
-        parts = columns_str.split(',')
+        # 1. 괄호를 고려한 스마트 콤마 분리
+        parts = self._smart_comma_split(columns_str)
         
         for part in parts:
             part = part.strip()
+            
+            # 함수형 인덱스 완전 제거 (스마트 분리 후에)
+            if self._is_functional_index(part):
+                continue
+            
+            # 빈 파트나 무효한 파트 건너뛰기
+            if not part or part in ['', '10)', "'", '"']:
+                continue
             
             # 2. 각 부분에서 컬럼명만 추출
             # `column_name`(length) -> column_name
             # column_name ASC/DESC -> column_name
             
-            # (length) 부분 먼저 제거
-            part = re.sub(r'\([^)]*\)', '', part)
+            # (length) 부분 제거 (단순한 괄호만)
+            part = re.sub(r'\(\d+\)', '', part)
             
             # ASC/DESC 제거
             part = re.sub(r'\s+(ASC|DESC)\s*$', '', part, flags=re.IGNORECASE)
@@ -573,6 +625,66 @@ class MySQLDDLParser(BaseDDLParser):
                 columns.append(col_name)
                 
         return columns
+    
+    def _smart_comma_split(self, text: str) -> List[str]:
+        """괄호와 따옴표를 고려한 스마트 콤마 분리"""
+        parts = []
+        current_part = ""
+        paren_depth = 0
+        quote_char = None
+        
+        i = 0
+        while i < len(text):
+            char = text[i]
+            
+            # 따옴표 처리
+            if char in ("'", '"') and (i == 0 or text[i-1] != '\\'):
+                if quote_char is None:
+                    quote_char = char
+                elif quote_char == char:
+                    quote_char = None
+            
+            # 괄호 처리 (따옴표 안이 아닐 때만)
+            elif quote_char is None:
+                if char == '(':
+                    paren_depth += 1
+                elif char == ')':
+                    paren_depth -= 1
+                elif char == ',' and paren_depth == 0:
+                    # 괄호 밖의 콤마만 분리점으로 사용
+                    parts.append(current_part.strip())
+                    current_part = ""
+                    i += 1
+                    continue
+            
+            current_part += char
+            i += 1
+        
+        # 마지막 부분 추가
+        if current_part.strip():
+            parts.append(current_part.strip())
+        
+        return parts
+    
+    def _is_functional_index(self, part: str) -> bool:
+        """함수형 인덱스인지 확인"""
+        part_lower = part.lower()
+        
+        # 1. 알려진 MySQL 함수들이 포함된 경우
+        mysql_functions = ['replace', 'right', 'left', 'substr', 'substring', 'concat', 
+                          'upper', 'lower', 'date_format', 'year', 'month', 'day']
+        if any(func in part_lower for func in mysql_functions):
+            return True
+        
+        # 2. 특수 문자 패턴 (UTF8 문자셋, 콜론 등)
+        if '_utf8mb3' in part or '_utf8mb4' in part:
+            return True
+        
+        # 3. 함수 호출 패턴 (괄호 안에 백틱이나 특수 문자)
+        if '(' in part and ('`' in part or ':' in part or '%' in part):
+            return True
+        
+        return False
     
     def _parse_foreign_key_constraint(self, token_values: List[str]) -> Optional[Dict]:
         """FOREIGN KEY 제약조건 파싱"""

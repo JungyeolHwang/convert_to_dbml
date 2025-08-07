@@ -15,13 +15,19 @@ class BaseDDLParser(ABC):
     
     def parse_file(self, file_path: str) -> Dict:
         """DDL 파일을 파싱하여 테이블 정보를 반환"""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except UnicodeDecodeError:
-            # UTF-8로 읽기 실패 시 다른 인코딩 시도
-            with open(file_path, 'r', encoding='latin-1') as f:
-                content = f.read()
+        # 시도할 인코딩 리스트 (한국어 환경에서 자주 사용되는 인코딩 포함)
+        encodings = ['utf-8', 'cp949', 'euc-kr', 'latin-1']
+        
+        for encoding in encodings:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    content = f.read()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            # 모든 인코딩 실패 시 오류 발생
+            raise UnicodeDecodeError(f"Cannot decode file {file_path} with any of the supported encodings: {encodings}")
         
         return self.parse_ddl_content(content)
     

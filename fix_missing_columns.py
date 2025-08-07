@@ -10,8 +10,19 @@ from typing import Dict, List
 
 def find_missing_columns_in_ddl(ddl_file_path: str) -> List[Dict]:
     """DDL 파일에서 파서가 놓칠 수 있는 컬럼들을 찾기"""
-    with open(ddl_file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
+    # 시도할 인코딩 리스트
+    encodings = ['utf-8', 'cp949', 'euc-kr', 'latin-1']
+    
+    for encoding in encodings:
+        try:
+            with open(ddl_file_path, 'r', encoding=encoding) as f:
+                content = f.read()
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        # 모든 인코딩 실패 시 오류 발생
+        raise UnicodeDecodeError(f"Cannot decode file {ddl_file_path} with any of the supported encodings: {encodings}")
     
     # 간단한 정규식으로 컬럼 정의 찾기
     column_pattern = r'`([^`]+)`\s+([a-zA-Z]+(?:\([^)]*\))?)\s+([^,]+?)(?=,|\n\s*(?:PRIMARY|UNIQUE|KEY|CONSTRAINT|\)))'
@@ -46,9 +57,19 @@ def fix_dbml_missing_columns(dbml_file_path: str, schema_dir: str):
     
     print(f"🔍 검사 중: {dbml_file_path}")
     
-    # DBML 파일 읽기
-    with open(dbml_file_path, 'r', encoding='utf-8') as f:
-        dbml_content = f.read()
+    # DBML 파일 읽기 (인코딩 처리)
+    encodings = ['utf-8', 'cp949', 'euc-kr', 'latin-1']
+    
+    for encoding in encodings:
+        try:
+            with open(dbml_file_path, 'r', encoding=encoding) as f:
+                dbml_content = f.read()
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        # 모든 인코딩 실패 시 오류 발생
+        raise UnicodeDecodeError(f"Cannot decode file {dbml_file_path} with any of the supported encodings: {encodings}")
     
     # 각 테이블별로 확인
     table_pattern = r'Table\s+(\w+)\s*\{([^}]+)\}'
