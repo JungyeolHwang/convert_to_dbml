@@ -27,7 +27,6 @@ class DDLToDBMLConverter:
     
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
-        self.ddl_parser = DDLParser()
         self.dbml_converter = DBMLConverter()
         self.stats = {
             'databases_processed': 0,
@@ -140,13 +139,18 @@ class DDLToDBMLConverter:
         if self.verbose:
             print(f"  📁 스키마: {schema_name} ({len(ddl_files)}개 테이블)")
         
+        # 데이터베이스 타입에 따라 적절한 파서 선택
+        db_info = scanner.get_database_info(db_name)
+        db_type = db_info['db_type']
+        ddl_parser = DDLParser(db_type)
+        
         # 모든 DDL 파일을 파싱
         all_tables = {}
         table_count = 0
         
         for ddl_file in ddl_files:
             try:
-                tables_data = self.ddl_parser.parse_file(ddl_file)
+                tables_data = ddl_parser.parse_file(ddl_file)
                 all_tables.update(tables_data)
                 table_count += len(tables_data)
                 
